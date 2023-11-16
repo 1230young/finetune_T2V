@@ -31,17 +31,148 @@ from typing import List, Optional
 from uuid import uuid4
 
 import numpy as np
+
+# np.set_printoptions(threshold=np.inf)
 import torch
 from compel import Compel
-from diffusers import DPMSolverMultistepScheduler, TextToVideoSDPipeline, UNet3DConditionModel
+from diffusers import DPMSolverMultistepScheduler, TextToVideoSDPipeline, UNet3DConditionModel, StableDiffusionAdapterPipeline
 from einops import rearrange
-from torch import Tensor
+from torch import Tensor, einsum
 from torch.nn.functional import interpolate
 from tqdm import trange
+import math
+
 
 from train import export_to_video, handle_memory_attention, load_primary_models
 from utils.lama import inpaint_watermark
 from utils.lora import inject_inferable_lora
+from nltk import word_tokenize
+
+import imageio
+from diffusers.models.attention_processor import Attention
+from utils.chat import askChatGPT
+def update_layer_names(model,hidden_layer_select = None):
+    hidden_layers = {}
+    for n, m in model.named_modules():
+        if(isinstance(m, Attention)):
+            hidden_layers[n] = m
+    hidden_layer_names = list(filter(lambda s : "attn2" in s, hidden_layers.keys())) 
+    if hidden_layer_select != None:
+        hidden_layer_select.update(value="model.diffusion_model.middle_block.1.transformer_blocks.0.attn2", choice=hidden_layer_names)
+    return hidden_layers,hidden_layer_names
+
+def get_attn(emb, ret, f=16):
+    def hook(self, sin, sout):
+        h = self.heads
+        q = self.to_q(sin[0])
+        context = emb
+
+        k = self.to_k(context)
+        q=rearrange(q, '(b f) n (h d) -> (b h) (f n) d',f=f, h=h)
+        k=rearrange(k, 'b n (h d) -> (b h) n d', h=h)
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        sim=rearrange(sim, 'b (f i) j -> b f i j',f=f)
+        attn = sim.softmax(dim=-1)
+        ret["out"] = attn
+    return hook
+
+
+def decode_attention_map(attn_map, video, output_mode,idx='', separate=False):
+    output=video.clone().to("cpu").numpy()
+
+
+    if (idx == ""):
+        vid = attn_map[:,:,:,1:].sum(-1).sum(0).unsqueeze(0)
+    else:
+        try:
+            idxs = list(map(int, filter(lambda x : x != '', idx.strip().split(','))))
+            if separate:
+
+                vid = rearrange(attn_map[:,:,:,idxs].sum(0), "f x n-> n f x")
+                output=np.repeat(output,vid.shape[0],axis=0)
+            else:
+                vid = attn_map[:,:,:,idxs].sum(-1).sum(0).unsqueeze(0)
+        except:
+            return output
+
+    scale = round(math.sqrt((video.shape[3] * video.shape[4]) / vid.shape[2]))
+    n=vid.shape[0]
+    f=video.shape[2]
+    h = video.shape[3] // scale
+    w = video.shape[4] // scale
+    vid = vid.reshape(n,f,h, w) 
+    for i in range(n):
+        for j in range(f):
+        
+            vid[i][j]=vid[i][j]/vid[i][j].max()
+        
+    vid = vid.to("cpu").numpy()
+    output = output.astype(np.float64)
+    if output_mode == "masked":
+        for i in range(output.shape[3]):
+            for j in range(output.shape[4]):
+                output[:,:,:,i,j] *= vid[:,:,i // scale,j // scale]
+
+    elif output_mode == "grey":
+
+        for i in range(output.shape[3]):
+            for j in range(output.shape[4]):
+                output[:,:,:,i,j] = np.repeat(np.expand_dims(vid[:,:,i // scale,j // scale],axis=1),3,axis=1)   
+    return output
+
+def layer_save_name(layer):
+    if layer.startswith("mid"):
+        return "mid"
+    else:
+        return f"{layer.split('_')[0]}_{layer.split('.')[1]}"
+    
+def video_residual(video):
+    video=video.astype(np.float64)
+    residual = video[1:]-video[:-1]
+    residual[:,:,:,0]=np.where(residual[:,:,:,0]>=0,residual[:,:,:,0],0)
+    residual[:,:,:,1]=np.where(residual[:,:,:,1]<0,-residual[:,:,:,1],0)
+    residual[:,:,:,2]=np.where(residual[:,:,:,2]<0,0,0)
+    residual=residual.astype(np.uint8)
+    return residual
+
+    
+
+def video2longImage(video):
+    image = video[0]
+    for i in range(1,video.shape[0]):
+        image = np.concatenate((image,video[i]),axis=1)
+    return image
+
+def get_idx(prompt):
+    question=f"give the key nouns in the sentence that depict an entity in the scene. Only entities that will appear in the scene, not other nouns, should be given. Your response should only contain a list of nouns separated by commas. [Example: Sentence:'a blurry image of two people standing next to each other in a dark room'. Response: people, room] Now we have the Sentence: '{prompt}' "
+    response = askChatGPT(question)
+    if response is None:
+        return None,None
+    target_nouns=[noun.strip('\n').strip('.')for noun in response.split(", ")]
+    if isinstance(prompt,list):
+        prompt=prompt[0]
+    prompt_list=word_tokenize(prompt)
+    prompt_list=[i.lower() for i in prompt_list]
+    idxs=[]
+    nouns_not_found=[]
+    print(target_nouns)
+    for noun in target_nouns:
+        try:
+            idx=prompt_list.index(noun.lower())+1
+            if idx>=76:
+                continue
+            idxs.append(str(idx))
+        except Exception:
+            nouns_not_found.append(noun)
+            print(f"noun {noun} not in prompt")
+    for noun in nouns_not_found:
+        target_nouns.remove(noun)
+            
+        
+    
+
+
+    return ",".join(idxs),target_nouns
 
 
 def initialize_pipeline(
@@ -57,7 +188,11 @@ def initialize_pipeline(
 
         scheduler, tokenizer, text_encoder, vae, _unet = load_primary_models(model)
         del _unet  # This is a no op
+        # unet = UNet3DConditionModel.from_pretrained(model, subfolder="unet",torch_dtype=torch.float16, variant="fp16")
         unet = UNet3DConditionModel.from_pretrained(model, subfolder="unet")
+        hidden_layers,hidden_layer_names=update_layer_names(unet)
+
+
 
     pipe = TextToVideoSDPipeline.from_pretrained(
         pretrained_model_name_or_path=model,
@@ -66,8 +201,11 @@ def initialize_pipeline(
         text_encoder=text_encoder.to(device=device, dtype=torch.half),
         vae=vae.to(device=device, dtype=torch.half),
         unet=unet.to(device=device, dtype=torch.half),
+    
+        # torch_dtype=torch.float16, variant="fp16"
     )
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    # pipe.unet.set_adapter
 
     unet.disable_gradient_checkpointing()
     handle_memory_attention(xformers, sdp, unet)
@@ -75,7 +213,7 @@ def initialize_pipeline(
 
     inject_inferable_lora(pipe, lora_path, r=lora_rank)
 
-    return pipe
+    return pipe, hidden_layer_names, hidden_layers
 
 
 def prepare_input_latents(
@@ -163,6 +301,8 @@ def diffuse(
     guidance_scale: float,
     window_size: int,
     rotate: bool,
+    layer_selected: Optional[str] = None,
+    timestep_att: Optional[int] = None,
 ):
     device = pipe.device
     order = pipe.scheduler.config.solver_order if "solver_order" in pipe.scheduler.config else pipe.scheduler.order
@@ -175,6 +315,24 @@ def diffuse(
         negative_prompt=negative_prompt,
         prompt_embeds=prompt_embeds,
         negative_prompt_embeds=negative_prompt_embeds,
+        device=device,
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=do_classifier_free_guidance,
+    )
+    neg_prompt_embeds = pipe._encode_prompt(
+        prompt=[''],
+        negative_prompt=negative_prompt,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        device=device,
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=do_classifier_free_guidance,
+    )
+    prompt_embeds_without_neg = pipe._encode_prompt(
+        prompt=prompt,
+        negative_prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
         device=device,
         num_images_per_prompt=1,
         do_classifier_free_guidance=do_classifier_free_guidance,
@@ -197,11 +355,16 @@ def diffuse(
     if rotate:
         shifts = np.random.permutation(primes_up_to(window_size))
         total_shift = 0
+    attn_out={}
+    if negative_prompt is not None:
+        attn_neg_out={}
+    else:
+        attn_neg_out=None
 
     with pipe.progress_bar(total=len(timesteps) * num_frames // window_size) as progress:
         for i, t in enumerate(timesteps):
             progress.set_description(f"Diffusing timestep {t}...")
-
+        
             if rotate:  # rotate latents by a random amount (so each timestep has different chunk borders)
                 shift = shifts[i % len(shifts)]
                 model_outputs = [None if pl is None else torch.roll(pl, shifts=shift, dims=2) for pl in model_outputs]
@@ -225,13 +388,52 @@ def diffuse(
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents_window] * 2) if do_classifier_free_guidance else latents_window
                 latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
+                if layer_selected is not None and timestep_att==i:
+                    if isinstance(layer_selected,list):
+                        attn_out=[]
+                        handles=[]
+                        attn_neg_out=[]
+                        handles_neg=[]
+                        for layer in layer_selected:
+                            a={}
+                            handle = layer.register_forward_hook(get_attn(prompt_embeds, a,f=num_frames))
+                            attn_out.append(a)
+                            handles.append(handle)
+                        noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
 
+                        for handle in handles:
+                            handle.remove()
+                        if negative_prompt is not None:
+                            for layer in layer_selected:
+                                a_neg={}
+                                handle_neg = layer.register_forward_hook(get_attn(neg_prompt_embeds, a_neg,f=num_frames))
+                                attn_neg_out.append(a_neg)
+                                handles_neg.append(handle_neg)
+                            noise_pred_neg = pipe.unet(latent_model_input, t, encoder_hidden_states=neg_prompt_embeds).sample
+
+                            for handle_neg in handles_neg:
+                                handle_neg.remove()
+                    else:
+                        handle = layer_selected.register_forward_hook(get_attn(prompt_embeds, attn_out,f=num_frames))
+                        if negative_prompt is not None:
+                            handle_neg=layer_selected.register_forward_hook(get_attn(neg_prompt_embeds, attn_neg_out,f=num_frames))
+                        noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
+                        handle.remove()
+                        if negative_prompt is not None:
+                            handle_neg=layer_selected.register_forward_hook(get_attn(neg_prompt_embeds, attn_neg_out,f=num_frames))
+                            noise_pred_neg = pipe.unet(latent_model_input, t, encoder_hidden_states=neg_prompt_embeds).sample
+                            handle_neg.remove()
                 # predict the noise residual
                 noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
 
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    #Perp-Neg
+                    # if negative_prompt is not None:
+                    #     proj_neg =noise_pred_uncond-torch.mul(torch.div(einsum("b c f h w, b c f h w -> b f", noise_pred_text, noise_pred_uncond),einsum("b c f h w, b c f h w -> b f", noise_pred_text, noise_pred_text)),noise_pred_text)
+                    #     noise_pred = proj_neg + guidance_scale * (noise_pred_text - proj_neg)
+
 
                 # reshape latents for scheduler
                 pipe.scheduler.model_outputs = [
@@ -263,8 +465,13 @@ def diffuse(
 
     if rotate:
         new_latents = torch.roll(new_latents, shifts=-total_shift, dims=2)
-
-    return new_latents
+    
+    if layer_selected is not None:
+        if isinstance(layer_selected,list):
+            return new_latents,[a["out"] for a in attn_out], [a["out"] for a in attn_neg_out]
+        else:
+            return new_latents,attn_out["out"], attn_neg_out["out"]
+    return new_latents,None
 
 
 @torch.inference_mode()
@@ -288,13 +495,28 @@ def inference(
     lora_rank: int = 64,
     loop: bool = False,
     seed: Optional[int] = None,
+    layer_selected: Optional[str] = None,
+    timestep_att: Optional[int] = None,
+    output_mode: str = "grey",
+    separate: bool = False
 ):
     if seed is not None:
         torch.manual_seed(seed)
+    else:
+        torch.manual_seed(123)
 
     with torch.autocast(device, dtype=torch.half):
         # prepare models
-        pipe = initialize_pipeline(model, device, xformers, sdp, lora_path, lora_rank)
+        pipe, hidden_layer_names, hidden_layers = initialize_pipeline(model, device, xformers, sdp, lora_path, lora_rank)
+        print(hidden_layer_names)
+        print(len(hidden_layer_names))
+        if layer_selected is not None:
+            if isinstance(layer_selected,list):
+                layer=[]
+                for l in layer_selected:
+                    layer.append(hidden_layers[l])
+            else:
+                layer=hidden_layers[layer_selected]
 
         # prepare prompts
         compel = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
@@ -311,9 +533,9 @@ def inference(
             vae_batch_size=vae_batch_size,
         )
         init_weight = init_weight if init_video is not None else 0  # ignore init_weight as there is no init_video!
-
         # run diffusion
-        latents = diffuse(
+
+        latents, att_map, att_neg_map = diffuse(
             pipe=pipe,
             latents=init_latents,
             init_weight=init_weight,
@@ -325,12 +547,36 @@ def inference(
             guidance_scale=guidance_scale,
             window_size=window_size,
             rotate=loop or window_size < num_frames,
+            layer_selected=layer,
+            timestep_att=timestep_att
         )
 
         # decode latents to pixel space
         videos = decode(pipe, latents, vae_batch_size)
+        idx_nouns,target_nouns=get_idx(prompt)
+        if isinstance(att_map,list):
+            for i in range(len(att_map)):
+                att_map[i]=decode_attention_map(att_map[i],videos,output_mode,idx="",separate=separate)
 
-    return videos
+                # att_map[i]=decode_attention_map(att_map[i],videos,"grey",idx=idx_nouns)
+
+        else:
+            att_map=decode_attention_map(att_map,videos,output_mode,idx="",separate=separate)
+            # att_map=decode_attention_map(att_map,videos,"grey",idx=idx_nouns)
+        if negative_prompt is not None:
+            if isinstance(att_neg_map,list):
+                for i in range(len(att_neg_map)):
+                    att_neg_map[i]=decode_attention_map(att_neg_map[i],videos,output_mode,idx='')
+
+
+            else:
+                att_neg_map=decode_attention_map(att_neg_map,videos,output_mode,idx='')
+            
+            
+        
+
+
+    return videos, att_map, att_neg_map,target_nouns
 
 
 if __name__ == "__main__":
@@ -354,7 +600,7 @@ if __name__ == "__main__":
     parser.add_argument("-g", "--guidance-scale", type=float, default=25, help="Scale for guidance loss (higher values = more guidance, but possibly more artifacts).")
     parser.add_argument("-i", "--init-video", type=str, default=None, help="Path to video to initialize diffusion from (will be resized to the specified num_frames, height, and width).")
     parser.add_argument("-iw", "--init-weight", type=float, default=0.5, help="Strength of visual effect of init_video on the output (lower values adhere more closely to the text prompt, but have a less recognizable init_video).")
-    parser.add_argument("-f", "--fps", type=int, default=12, help="FPS of output video")
+    parser.add_argument("-f", "--fps", type=int, default=24, help="FPS of output video")
     parser.add_argument("-d", "--device", type=str, default="cuda", help="Device to run inference on (defaults to cuda).")
     parser.add_argument("-x", "--xformers", action="store_true", help="Use XFormers attnetion, a memory-efficient attention implementation (requires `pip install xformers`).")
     parser.add_argument("-S", "--sdp", action="store_true", help="Use SDP attention, PyTorch's built-in memory-efficient attention implementation.")
@@ -363,6 +609,10 @@ if __name__ == "__main__":
     parser.add_argument("-rw", "--remove-watermark", action="store_true", help="Post-process the videos with LAMA to inpaint ModelScope's common watermarks.")
     parser.add_argument("-l", "--loop", action="store_true", help="Make the video loop (by rotating frame order during diffusion).")
     parser.add_argument("-r", "--seed", type=int, default=None, help="Random seed to make generations reproducible.")
+    parser.add_argument("-att", "--layer_selected", type=str, default=None, help="Which attention map to watch.")
+    parser.add_argument("-t", "--timestep_att", type=int, default=None, help="Diffusion timestep of output attention map.")
+    parser.add_argument("-om", "--output_mode", type=str, default="grey", help="output mode of attention maps")
+    parser.add_argument("-sep", "--separate", type=bool, default=False, help="separate attention maps for different nouns")
     args = parser.parse_args()
     # fmt: on
 
@@ -392,8 +642,19 @@ if __name__ == "__main__":
     # =========================================
     # ============= sample videos =============
     # =========================================
+    default_hidden_layer_name = "mid_block.attentions.0.transformer_blocks.0.attn2"
+    all_hidden_layer_name=["down_blocks.0.attentions.1.transformer_blocks.0.attn2",
+                           "down_blocks.1.attentions.1.transformer_blocks.0.attn2",
+                           "down_blocks.2.attentions.1.transformer_blocks.0.attn2",
+                           "up_blocks.1.attentions.2.transformer_blocks.0.attn2",
+                           "up_blocks.2.attentions.2.transformer_blocks.0.attn2",
+                           "up_blocks.3.attentions.2.transformer_blocks.0.attn2",
+                           "mid_block.attentions.0.transformer_blocks.0.attn2"
+                           ]
+    if args.layer_selected=="all":
+        args.layer_selected=all_hidden_layer_name
 
-    videos = inference(
+    videos,att_map, attn_neg_map, target_nouns = inference(
         model=args.model,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
@@ -412,7 +673,12 @@ if __name__ == "__main__":
         lora_path=args.lora_path,
         lora_rank=args.lora_rank,
         loop=args.loop,
+        layer_selected=args.layer_selected,
+        timestep_att=args.timestep_att,
+        output_mode=args.output_mode,
+        separate=args.separate
     )
+    target_nouns=['all']
 
     # =========================================
     # ========= write outputs to file =========
@@ -420,7 +686,7 @@ if __name__ == "__main__":
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    for video in videos:
+    for i,video in enumerate(videos):
         if args.remove_watermark:
             print("Inpainting watermarks...")
             video = rearrange(video, "c f h w -> f c h w").add(1).div(2)
@@ -431,5 +697,76 @@ if __name__ == "__main__":
             video = rearrange(video, "c f h w -> f h w c").clamp(-1, 1).add(1).mul(127.5)
 
         video = video.byte().cpu().numpy()
+        if isinstance(att_map,list):
+            att=[]
+            for a in att_map:
+                if args.separate:
+                    temp=(np.clip(rearrange(a[i::args.batch_size], "n c f h w -> n f h w c"),0,1))*255
+                else:
+                    temp=(np.clip(rearrange(a[i], "c f h w -> f h w c"),0,1))*255
+                att.append(temp.astype(np.uint8))
+        else:
+            if args.separate:
+                att=(np.clip(rearrange(att_map[i::args.batch_size], "n c f h w -> n f h w c"),0,1))*255
+            else:
+                att=(np.clip(rearrange(att_map[i], "c f h w -> f h w c"),0,1))*255
+            att=att.astype(np.uint8)
+        if isinstance(attn_neg_map,list):
+            att_neg=[]
+            for a in attn_neg_map:
+                
+                temp=(np.clip(rearrange(a[i], "c f h w -> f h w c"),0,1))*255
+                att_neg.append(temp.astype(np.uint8))
+        else:
+            att_neg=(np.clip(rearrange(attn_neg_map[i], "c f h w -> f h w c"),0,1))*255
+            att_neg=att_neg.astype(np.uint8)
 
-        export_to_video(video, f"{out_name} {str(uuid4())[:8]}.mp4", args.fps)
+
+        # export_to_video(video, f"{out_name} {str(uuid4())[:8]}.mp4", args.fps)
+        if len(out_name)>100:
+            out_name = out_name[:100]
+            out_name+=f'_{args.timestep_att}'
+        imageio.mimsave(f"{out_name}.gif", video,'GIF', fps=args.fps)
+        if isinstance(att,list) or args.separate:
+            os.makedirs(out_name, exist_ok=True)
+            if args.separate:
+                for i,at in enumerate(att):
+                    save_name=layer_save_name(args.layer_selected[i])
+                    for n,a in enumerate(at):
+                        dir_name=f"{out_name}/{target_nouns[n]}"
+                        os.makedirs(dir_name, exist_ok=True)
+                        imageio.mimsave(f"{dir_name}/{save_name}.gif", a,'GIF', fps=args.fps)
+                        imageio.mimsave(f"{dir_name}/{save_name}_residual.gif", video_residual(a),'GIF', fps=args.fps)
+                        imageio.imwrite(f"{dir_name}/{save_name}.jpg",video2longImage(a))
+                        imageio.imwrite(f"{dir_name}/{save_name}_residual.jpg",video2longImage(video_residual(a)))
+
+                    
+            else:
+                for i,a in enumerate(att):
+                    save_name=layer_save_name(args.layer_selected[i])
+                    imageio.mimsave(f"{out_name}/{save_name}.gif", a,'GIF', fps=args.fps)
+                    imageio.mimsave(f"{out_name}/{save_name}_residual.gif", video_residual(a),'GIF', fps=args.fps)
+                    imageio.imwrite(f"{out_name}/{save_name}.jpg",video2longImage(a))
+                    imageio.imwrite(f"{out_name}/{save_name}_residual.jpg",video2longImage(video_residual(a)))
+            dir_name=f"{out_name}/negative"
+            os.makedirs(dir_name, exist_ok=True)
+            for i,a in enumerate(att_neg):
+                save_name=layer_save_name(args.layer_selected[i])
+                imageio.mimsave(f"{dir_name}/{save_name}.gif", a,'GIF', fps=args.fps)
+                imageio.mimsave(f"{dir_name}/{save_name}_residual.gif", video_residual(a),'GIF', fps=args.fps)
+                imageio.imwrite(f"{dir_name}/{save_name}.jpg",video2longImage(a))
+                imageio.imwrite(f"{dir_name}/{save_name}_residual.jpg",video2longImage(video_residual(a)))
+        else:
+            if args.separate:
+                for n,a in enumerate(att):
+                    save_name=target_nouns[n]
+                    imageio.mimsave(f"{out_name}/{save_name}.gif", a,'GIF', fps=args.fps)
+                    imageio.mimsave(f"{out_name}/{save_name}_residual.gif", video_residual(a),'GIF', fps=args.fps)
+                    imageio.imwrite(f"{out_name}/{save_name}.jpg",video2longImage(a))
+                    imageio.imwrite(f"{out_name}/{save_name}_residual.jpg",video2longImage(video_residual(a)))
+            else:
+                imageio.mimsave(f"{out_name}_att_map.gif", att,'GIF', fps=args.fps)
+                imageio.mimsave(f"{out_name}_att_map_residual.gif", video_residual(att),'GIF', fps=args.fps)
+                imageio.imwrite(f"{out_name}_att_map.jpg",video2longImage(att))
+                imageio.imwrite(f"{out_name}_att_map_residual.jpg",video2longImage(video_residual(att)))
+

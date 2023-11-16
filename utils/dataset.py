@@ -19,7 +19,7 @@ from torch.utils.data import Dataset
 from einops import rearrange, repeat
 
     # Inspired by the VideoMAE repository.
-    def normalize_input(
+def normalize_input(
         item, 
         mean=[0.5, 0.5, 0.5], # Imagenet [0.485, 0.456, 0.406]
         std=[0.5, 0.5, 0.5], # Imagenet [0.229, 0.224, 0.225]
@@ -38,7 +38,7 @@ from einops import rearrange, repeat
         else:
             
             item = rearrange(item, 'f c h w -> f h w c')
-            return  rearrange(item / (127.5 - 1.0), 'f h w c -> f c h w')
+            return  rearrange(item / 127.5 - 1.0, 'f h w c -> f c h w')
             
 def get_prompt_ids(prompt, tokenizer):
     prompt_ids = tokenizer(
@@ -92,6 +92,8 @@ def get_video_frames(vr, start_idx, sample_rate=1, max_frames=24):
 
     frame_range = range(frame_number, max_range, sample_rate)
     frame_range_indices = list(frame_range)[:max_frames]
+    if len(frame_range_indices) < max_frames:
+        frame_range_indices = list(range(max_range-sample_rate*max_frames, max_range, sample_rate))
 
     return frame_range_indices
 
@@ -122,6 +124,7 @@ class VideoJsonDataset(Dataset):
             vid_data_key: str = "video_path",
             preprocessed: bool = False,
             use_bucketing: bool = False,
+            normalize=True,
             **kwargs
     ):
         self.vid_types = (".mp4", ".avi", ".mov", ".webm", ".flv", ".mjpeg")
@@ -138,6 +141,7 @@ class VideoJsonDataset(Dataset):
         self.n_sample_frames = n_sample_frames
         self.sample_start_idx = sample_start_idx
         self.frame_step = frame_step
+        self.normalize=normalize
 
     def build_json(self, json_data):
         extended_data = []
@@ -255,7 +259,11 @@ class VideoJsonDataset(Dataset):
         prompt = train_data['prompt']
         vr.seek(0)
 
-        prompt_ids = get_prompt_ids(prompt, self.tokenizer)
+        if self.tokenizer is not None:
+
+            prompt_ids = get_prompt_ids(prompt, self.tokenizer)
+        else:
+            prompt_ids =1
 
         return video, prompt, prompt_ids
 
@@ -278,13 +286,22 @@ class VideoJsonDataset(Dataset):
         # Use default JSON training
         if self.train_data is not None:
             video, prompt, prompt_ids = self.train_data_batch(index)
-
-        example = {
-            "pixel_values": normalize_input(video),
-            "prompt_ids": prompt_ids[0],
-            "text_prompt": prompt,
-            'dataset': self.__getname__()
-        }
+        
+        if self.normalize:
+            
+            example = {
+                "pixel_values": normalize_input(video),
+                "prompt_ids": prompt_ids,
+                "text_prompt": prompt,
+                'dataset': self.__getname__()
+            }
+        else:
+            example = {
+                "pixel_values": video,
+                "prompt_ids": prompt_ids,
+                "text_prompt": prompt,
+                'dataset': self.__getname__()
+            }
 
         return example
 
@@ -392,7 +409,7 @@ class SingleVideoDataset(Dataset):
 
         example = {
             "pixel_values": normalize_input(video),
-            "prompt_ids": prompt_ids[0],
+            "prompt_ids": prompt_ids,
             "text_prompt": prompt,
             'dataset': self.__getname__()
         }
@@ -486,7 +503,7 @@ class ImageDataset(Dataset):
         img, prompt, prompt_ids = self.image_batch(index)
         example = {
             "pixel_values": normalize_input(img),
-            "prompt_ids": prompt_ids[0],
+            "prompt_ids": prompt_ids,
             "text_prompt": prompt, 
             'dataset': self.__getname__()
         }
@@ -584,7 +601,7 @@ class VideoFolderDataset(Dataset):
 
         prompt_ids = self.get_prompt_ids(prompt)
 
-        return {"pixel_values": normalize_input(video[0]), "prompt_ids": prompt_ids[0], "text_prompt": prompt, 'dataset': self.__getname__()}
+        return {"pixel_values": normalize_input(video[0]), "prompt_ids": prompt_ids, "text_prompt": prompt, 'dataset': self.__getname__()}
 
 class CachedDataset(Dataset):
     def __init__(self,cache_dir: str = ''):
@@ -601,3 +618,5 @@ class CachedDataset(Dataset):
     def __getitem__(self, index):
         cached_latent = torch.load(self.cached_data_list[index], map_location='cuda:0')
         return cached_latent
+
+    

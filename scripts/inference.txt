@@ -1,0 +1,28 @@
+python inference.py \
+  --model models/models/model_scope_diffusers \
+  --prompt "a group of people are running away from an explosion in the background" \
+  --num-frames 16 \
+  --window-size 16 \
+  --width 256 \
+  --height 256 \
+  --seed 64 \
+  --sdp
+
+python inference.py \
+  --model /raid/pengyuyang/code/Text-To-Video-Finetuning/train_outputs/train_2023-10-26T19-30-55/checkpoint-5000 \
+  --output-dir ./output/zeroscope_5000 \
+  --prompt "A batman and a spiderman, dressed in their respective superhero costumes, are standing on a beach, surfing on surfboards. Spiderman is at the front, leaning forward with his hands gripping the edges of the surfboard; Batman is at the back, leaning slightly backward with his hands on his waist. They are both having a great time enjoying the thrill of surfing. This high-definition photo captures the dynamic and adventurous spirit of these iconic superheroes, making it an excellent choice for any project related to action, adventure, or superhero themes." \
+  --negative-prompt "((disfigured)), ((misshapen)), ((extra limbs)), ((extra heads)), ((out of frame)), ((poorly dressed)), ((bad composition)), ((poorly photoshopped)), (low-res), (bad framing), (unattractive), (pixelated), (blurry), (poor lighting), (unflattering), (awkward pose), (unnatural), (awkward), (ugly), (poorly drawn), (low quality), (clumsy), (insipid)" \
+  --num-frames 16 \
+  --window-size 16 \
+  --width 1024 \
+  --height 576 \
+  --seed 43 \
+  --sdp \
+  --layer_selected "all" \
+  --timestep_att 1 \
+  --separate True
+
+give the prompt and negative prompt for stable diffusion, describing "a girl is dancing"
+
+give the key nouns in the sentence in "<>"that depict an entity in the scene. Sentence: "High-quality photo of a rugged man enjoying a smoke break by the sea, capturing the sense of freedom and relaxation. Shot in high definition, this image is perfect for any project that requires a cool and laid-back vibe. A man wearing a black jacket and jeans, with a black hat and sunglasses, holding a cigarette in his right hand and his left hand in his pocket, standing on the beach with blue skies and sea waves in the background. "

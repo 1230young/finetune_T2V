@@ -11,6 +11,6 @@ decord
 tqdm
 safetensors
 omegaconf
-opencv-python
+opencv-pythonpython
 pydantic
 compel

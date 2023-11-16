@@ -41,6 +41,7 @@ from utils.dataset import VideoJsonDataset, SingleVideoDataset, \
     ImageDataset, VideoFolderDataset, CachedDataset
 from einops import rearrange, repeat
 from utils.lora_handler import LoraHandler, LORA_VERSIONS
+import imageio
 
 already_printed_trainables = False
 
@@ -121,6 +122,8 @@ def load_primary_models(pretrained_model_path):
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
     unet = UNet3DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
+
+
 
     return noise_scheduler, tokenizer, text_encoder, vae, unet
 
@@ -428,6 +431,7 @@ def save_pipe(
         unet=unet_out,
         text_encoder=text_encoder_out,
         vae=vae,
+        # torch_dtype=torch.float16, variant="fp16"
     ).to(torch_dtype=torch.float32)
     
     lora_manager.save_lora_weights(model=pipeline, save_path=save_path, step=global_step)
@@ -585,10 +589,10 @@ def main(
                         negation=text_encoder_negation
                    ),
         param_optim(text_encoder_lora_params, use_text_lora, is_lora=True, 
-                        extra_params={**{"lr": learning_rate}, **extra_unet_params}
+                        extra_params={**{"lr": learning_rate}, **extra_text_encoder_params}
                     ),
         param_optim(unet_lora_params, use_unet_lora, is_lora=True, 
-                        extra_params={**{"lr": learning_rate}, **extra_text_encoder_params}
+                        extra_params={**{"lr": learning_rate}, **extra_unet_params}
                     )
     ]
 
@@ -636,6 +640,7 @@ def main(
     # Process many datasets
     else:
         train_dataset = torch.utils.data.ConcatDataset(train_datasets) 
+    # print(len(train_dataset))
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -745,6 +750,7 @@ def main(
 
         # Get video length
         video_length = latents.shape[2]
+        print(video_length)
 
         # Sample noise that we'll add to the latents
         use_offset_noise = use_offset_noise and not rescale_schedule
@@ -782,6 +788,11 @@ def main(
             
         # Encode text embeddings
         token_ids = batch['prompt_ids']
+
+        # Assume extra batch dimnesion.
+        if len(token_ids.shape) > 2:
+            token_ids = token_ids[0]
+            
         encoder_hidden_states = text_encoder(token_ids)[0]
 
         # Get the target for loss depending on the prediction type
@@ -914,7 +925,8 @@ def main(
                                 pretrained_model_path,
                                 text_encoder=text_encoder,
                                 vae=vae,
-                                unet=unet
+                                unet=unet,
+                                # torch_dtype=torch.float16, variant="fp16"
                             )
 
                             diffusion_scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
@@ -929,14 +941,17 @@ def main(
                             
                             with torch.no_grad():
                                 video_frames = pipeline(
-                                    prompt,
+                                    prompt=prompt,
                                     width=validation_data.width,
                                     height=validation_data.height,
                                     num_frames=validation_data.num_frames,
                                     num_inference_steps=validation_data.num_inference_steps,
                                     guidance_scale=validation_data.guidance_scale
                                 ).frames
-                            export_to_video(video_frames, out_file, train_data.get('fps', 8))
+                            # export_to_video(video_frames, out_file, train_data.get('fps', 8))
+                            imageio.mimsave(out_file, video_frames, fps=8)
+
+
 
                             del pipeline
                             torch.cuda.empty_cache()
