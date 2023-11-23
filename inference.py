@@ -51,6 +51,7 @@ from nltk import word_tokenize
 import imageio
 from diffusers.models.attention_processor import Attention
 from utils.chat import askChatGPT
+from utils.attention_tools import attention_map_deflicker
 def update_layer_names(model,hidden_layer_select = None):
     hidden_layers = {}
     for n, m in model.named_modules():
@@ -70,6 +71,7 @@ def get_attn(emb, ret, f=16):
         k = self.to_k(context)
         q=rearrange(q, '(b f) n (h d) -> (b h) (f n) d',f=f, h=h)
         k=rearrange(k, 'b n (h d) -> (b h) n d', h=h)
+        
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
         sim=rearrange(sim, 'b (f i) j -> b f i j',f=f)
         attn = sim.softmax(dim=-1)
@@ -301,8 +303,9 @@ def diffuse(
     guidance_scale: float,
     window_size: int,
     rotate: bool,
-    layer_selected: Optional[str] = None,
+    layer_selected: Optional[List[int]] = None,
     timestep_att: Optional[int] = None,
+    layer_smooth: Optional[str] = None,
 ):
     device = pipe.device
     order = pipe.scheduler.config.solver_order if "solver_order" in pipe.scheduler.config else pipe.scheduler.order
@@ -361,6 +364,10 @@ def diffuse(
     else:
         attn_neg_out=None
 
+    smooth=False
+    if layer_smooth is not None:
+        smooth=True
+
     with pipe.progress_bar(total=len(timesteps) * num_frames // window_size) as progress:
         for i, t in enumerate(timesteps):
             progress.set_description(f"Diffusing timestep {t}...")
@@ -375,6 +382,8 @@ def diffuse(
             new_outputs = torch.zeros_like(latents)
 
             for idx in range(0, num_frames, window_size):  # diffuse each chunk individually
+
+                Layer_Smooth=layer_smooth.copy() if layer_smooth is not None else None
                 # update scheduler's previous outputs from our own cache
                 pipe.scheduler.model_outputs = [model_outputs[(i - 1 - o) % order] for o in reversed(range(order))]
                 pipe.scheduler.model_outputs = [
@@ -399,7 +408,7 @@ def diffuse(
                             handle = layer.register_forward_hook(get_attn(prompt_embeds, a,f=num_frames))
                             attn_out.append(a)
                             handles.append(handle)
-                        noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
+                        noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds, layer_smooth=Layer_Smooth, smooth=smooth, smooth_function=attention_map_deflicker).sample
 
                         for handle in handles:
                             handle.remove()
@@ -417,14 +426,14 @@ def diffuse(
                         handle = layer_selected.register_forward_hook(get_attn(prompt_embeds, attn_out,f=num_frames))
                         if negative_prompt is not None:
                             handle_neg=layer_selected.register_forward_hook(get_attn(neg_prompt_embeds, attn_neg_out,f=num_frames))
-                        noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
+                        noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds,layer_smooth=Layer_Smooth, smooth=smooth, smooth_function=attention_map_deflicker).sample
                         handle.remove()
                         if negative_prompt is not None:
                             handle_neg=layer_selected.register_forward_hook(get_attn(neg_prompt_embeds, attn_neg_out,f=num_frames))
                             noise_pred_neg = pipe.unet(latent_model_input, t, encoder_hidden_states=neg_prompt_embeds).sample
                             handle_neg.remove()
                 # predict the noise residual
-                noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
+                noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds,layer_smooth=Layer_Smooth, smooth=smooth, smooth_function=attention_map_deflicker).sample
 
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -498,7 +507,8 @@ def inference(
     layer_selected: Optional[str] = None,
     timestep_att: Optional[int] = None,
     output_mode: str = "grey",
-    separate: bool = False
+    separate: bool = False,
+    layer_smooth: Optional[List[int]] = None,
 ):
     if seed is not None:
         torch.manual_seed(seed)
@@ -548,29 +558,41 @@ def inference(
             window_size=window_size,
             rotate=loop or window_size < num_frames,
             layer_selected=layer,
-            timestep_att=timestep_att
+            timestep_att=timestep_att,
+            layer_smooth=layer_smooth,
         )
 
         # decode latents to pixel space
         videos = decode(pipe, latents, vae_batch_size)
         idx_nouns,target_nouns=get_idx(prompt)
+        if negative_prompt is not None:
+            # if isinstance(att_neg_map,list):
+            #     for i in range(len(att_neg_map)):
+            #         att_neg_map[i]=decode_attention_map(att_neg_map[i],videos,output_mode,idx='')
+
+
+            # else:
+            #     att_neg_map=decode_attention_map(att_neg_map,videos,output_mode,idx='')
+            if isinstance(att_map,list):
+                for i in range(len(att_map)):
+                    att_neg_map[i]=decode_attention_map(np.array_split(att_map[i],2)[0],videos,output_mode,idx='')
+
+
+            else:
+                att_neg_map=decode_attention_map(np.array_split(att_map,2)[0],videos,output_mode,idx='')
         if isinstance(att_map,list):
             for i in range(len(att_map)):
-                att_map[i]=decode_attention_map(att_map[i],videos,output_mode,idx="",separate=separate)
+                if layer_selected[i]=="up_blocks.2.attentions.2.transformer_blocks.0.attn2" or layer_selected[i]=="up_blocks.1.attentions.2.transformer_blocks.0.attn2":
+                    # att_map[i]=attention_map_deflicker(att_map[i],h=height,w=width)
+                    pass
+                att_map[i]=decode_attention_map(np.array_split(att_map[i],2)[1],videos,output_mode,idx="",separate=separate)
 
                 # att_map[i]=decode_attention_map(att_map[i],videos,"grey",idx=idx_nouns)
 
         else:
-            att_map=decode_attention_map(att_map,videos,output_mode,idx="",separate=separate)
+            att_map=decode_attention_map(np.array_split(att_map,2)[1],videos,output_mode,idx="",separate=separate)
             # att_map=decode_attention_map(att_map,videos,"grey",idx=idx_nouns)
-        if negative_prompt is not None:
-            if isinstance(att_neg_map,list):
-                for i in range(len(att_neg_map)):
-                    att_neg_map[i]=decode_attention_map(att_neg_map[i],videos,output_mode,idx='')
-
-
-            else:
-                att_neg_map=decode_attention_map(att_neg_map,videos,output_mode,idx='')
+        
             
             
         
@@ -613,6 +635,7 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--timestep_att", type=int, default=None, help="Diffusion timestep of output attention map.")
     parser.add_argument("-om", "--output_mode", type=str, default="grey", help="output mode of attention maps")
     parser.add_argument("-sep", "--separate", type=bool, default=False, help="separate attention maps for different nouns")
+    parser.add_argument("-smo", "--layer_smooth",nargs='+',default=None, help="which layer of attention map to smooth")
     args = parser.parse_args()
     # fmt: on
 
@@ -653,6 +676,9 @@ if __name__ == "__main__":
                            ]
     if args.layer_selected=="all":
         args.layer_selected=all_hidden_layer_name
+    if args.layer_smooth is not None and not isinstance(args.layer_smooth,list):
+        args.layer_smooth=[args.layer_smooth]
+    
 
     videos,att_map, attn_neg_map, target_nouns = inference(
         model=args.model,
@@ -676,7 +702,8 @@ if __name__ == "__main__":
         layer_selected=args.layer_selected,
         timestep_att=args.timestep_att,
         output_mode=args.output_mode,
-        separate=args.separate
+        separate=args.separate,
+        layer_smooth=args.layer_smooth
     )
     target_nouns=['all']
 
@@ -726,6 +753,7 @@ if __name__ == "__main__":
         if len(out_name)>100:
             out_name = out_name[:100]
             out_name+=f'_{args.timestep_att}'
+        out_name+='deflicker'
         imageio.mimsave(f"{out_name}.gif", video,'GIF', fps=args.fps)
         if isinstance(att,list) or args.separate:
             os.makedirs(out_name, exist_ok=True)

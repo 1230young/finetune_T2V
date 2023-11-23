@@ -1,6 +1,6 @@
 import openai
 def askChatGPT(question):
-    openai.api_key = "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"
+    openai.api_key = "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"
     prompt = question
     model_engine = "text-davinci-003"
 
